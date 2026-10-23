@@ -1,0 +1,147 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: "构建变体"
+        type: choice
+        options:
+          - release
+          - debug
+        default: release
+      publish_release:
+        description: "把 APK 发布到 Release（匿名可下载）"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+          cache-dependency-path: |
+            **/*.gradle*
+            **/gradle-wrapper.properties
+            gradle/libs.versions.toml
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web-ui/pnpm-lock.yaml
+
+      # web 模块的 preBuild 会执行 pnpm run build 把前端打进 APK，必须先装依赖
+      - name: Install web-ui dependencies
+        working-directory: web-ui
+        run: pnpm install --frozen-lockfile
+
+      # 没有上游的签名/Firebase 密钥，这里自造一套，保证能出可安装的 APK
+      - name: Prepare signing and firebase config
+        run: |
+          keytool -genkeypair -v \
+            -keystore "${{ github.workspace }}/build-keystore.jks" \
+            -alias rikkahub -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass android -keypass android \
+            -dname "CN=RikkaHub Fork Build, O=RikkaHub, C=CN"
+          cat > local.properties <<EOF
+          storeFile=${{ github.workspace }}/build-keystore.jks
+          storePassword=android
+          keyAlias=rikkahub
+          keyPassword=android
+          EOF
+          cat > app/google-services.json <<'EOF'
+          {
+            "project_info": {
+              "project_number": "123456789012",
+              "project_id": "rikkahub-fork-build",
+              "storage_bucket": "rikkahub-fork-build.appspot.com"
+            },
+            "client": [
+              {
+                "client_info": {
+                  "mobilesdk_app_id": "1:123456789012:android:0123456789abcdef",
+                  "android_client_info": {
+                    "package_name": "me.rerere.rikkahub"
+                  }
+                },
+                "oauth_client": [],
+                "api_key": [
+                  {
+                    "current_key": "AIzaSyDUMMYKEYDUMMYKEYDUMMYKEYDUMMYKEY000"
+                  }
+                ],
+                "services": {
+                  "appinvite_service": {
+                    "other_platform_oauth_client": []
+                  }
+                }
+              }
+            ],
+            "configuration_version": "1"
+          }
+          EOF
+          cat local.properties
+
+      - name: Build
+        run: |
+          chmod +x gradlew
+          if [ "${{ inputs.variant }}" = "debug" ]; then
+            ./gradlew assembleGithubDebug --stacktrace
+          else
+            ./gradlew assembleGithubRelease --stacktrace
+          fi
+
+      - name: Collect APKs
+        run: |
+          mkdir -p out
+          find app/build/outputs/apk -name "*.apk" -exec cp {} out/ \;
+          ls -lh out
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rikkahub-${{ inputs.variant }}-${{ github.run_number }}
+          path: out/*.apk
+          if-no-files-found: error
+
+      - name: Publish release
+        if: ${{ inputs.publish_release && inputs.variant == 'release' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: fork-build
+          name: Fork Build
+          prerelease: true
+          body: |
+            自签名构建（非官方签名，安装前需先卸载官方版）。
+
+            - commit: `${{ github.sha }}`
+            - 构建:#${{ github.run_number }}
+            - 分支: `${{ github.ref_name }}`
+          files: out/*.apk
